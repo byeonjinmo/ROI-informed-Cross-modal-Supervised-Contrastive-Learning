@@ -252,18 +252,19 @@ def find_optimal_threshold(y_true: np.ndarray, y_prob: np.ndarray) -> float:
     return best_t
 
 
-def compute_statistical_tests(fold_results: list) -> dict:
+def compute_statistical_tests(fold_results: list, prefix: str = "test") -> dict:
     """One-sample t-test: test if each metric is significantly above chance level."""
-    metrics_to_test = {
-        "val_auc": 0.5,
-        "val_aupr": 0.5,
-        "val_balanced_accuracy": 0.5,
-        "val_sensitivity": 0.5,
-        "val_specificity": 0.5,
-        "val_f1": 0.0,
-        "val_kappa": 0.0,
-        "val_mcc": 0.0,
+    chance_levels = {
+        "auc": 0.5,
+        "aupr": 0.5,
+        "balanced_accuracy": 0.5,
+        "sensitivity": 0.5,
+        "specificity": 0.5,
+        "f1": 0.0,
+        "kappa": 0.0,
+        "mcc": 0.0,
     }
+    metrics_to_test = {f"{prefix}_{k}": v for k, v in chance_levels.items()}
     results = {}
     for metric, chance in metrics_to_test.items():
         values = [r[metric] for r in fold_results]
@@ -278,11 +279,72 @@ def compute_statistical_tests(fold_results: list) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Leakage-free evaluation (nested CV over the full dataset)
+# ---------------------------------------------------------------------------
+
+def make_nested_splits(labels: np.ndarray, n_folds: int = 5, inner_val_size: float = 0.125,
+                       seed: int = 42):
+    """Outer stratified K-fold over ALL subjects + inner train/val split.
+
+    Every subject appears in exactly one outer test fold. Within each outer
+    fold, the training portion is further split into inner-train (fit model and
+    normalizer) and inner-val (early stopping + threshold selection). The outer
+    test fold is never touched until the final, single evaluation.
+
+    Yields (fold, train_idx, val_idx, test_idx) as indices into `labels`.
+    """
+    from sklearn.model_selection import StratifiedKFold, train_test_split
+
+    labels = np.asarray(labels)
+    all_idx = np.arange(len(labels))
+    outer = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+    for fold, (dev_idx, test_idx) in enumerate(outer.split(all_idx, labels), 1):
+        train_idx, val_idx = train_test_split(
+            dev_idx, test_size=inner_val_size,
+            stratify=labels[dev_idx], random_state=seed + fold,
+        )
+        assert not (set(train_idx) | set(val_idx)) & set(test_idx)
+        yield fold, np.sort(train_idx), np.sort(val_idx), np.sort(test_idx)
+
+
+def bootstrap_ci(y_true: np.ndarray, y_prob: np.ndarray, metric_fn,
+                 n_boot: int = 2000, alpha: float = 0.05, seed: int = 42) -> tuple:
+    """Stratified percentile bootstrap CI of a metric on pooled predictions."""
+    rng = np.random.default_rng(seed)
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    pos = np.where(y_true == 1)[0]
+    neg = np.where(y_true == 0)[0]
+    vals = []
+    for _ in range(n_boot):
+        idx = np.concatenate([rng.choice(pos, len(pos), replace=True),
+                              rng.choice(neg, len(neg), replace=True)])
+        vals.append(metric_fn(y_true[idx], y_prob[idx]))
+    lo, hi = np.percentile(vals, [100 * alpha / 2, 100 * (1 - alpha / 2)])
+    return float(lo), float(hi)
+
+
+def summarize_oof(y_true: np.ndarray, y_prob: np.ndarray, y_pred: np.ndarray,
+                  n_boot: int = 2000, seed: int = 42) -> dict:
+    """Pooled out-of-fold metrics. Each prediction comes from a model (and a
+    threshold) that never saw that subject, so the pooled metrics are leak-free."""
+    m = compute_metrics(y_true, y_prob, threshold=0.5)
+    # Overwrite threshold-dependent metrics with per-fold-threshold predictions
+    m_pred = compute_metrics(y_true, y_pred.astype(float), threshold=0.5)
+    for k in ["accuracy", "balanced_accuracy", "f1", "f1_weighted", "sensitivity",
+              "specificity", "ppv", "npv", "kappa", "mcc", "tp", "fp", "tn", "fn"]:
+        m[k] = m_pred[k]
+    m["auc_ci95"] = bootstrap_ci(y_true, y_prob, roc_auc_score, n_boot=n_boot, seed=seed)
+    m["aupr_ci95"] = bootstrap_ci(y_true, y_prob, average_precision_score, n_boot=n_boot, seed=seed)
+    return m
+
+
+# ---------------------------------------------------------------------------
 # Dataset building
 # ---------------------------------------------------------------------------
 
 def build_dataset(label_path: str, outputs_root: str, t1_root: str,
-                  adj_name: str, modality: str = "both"):
+                  adj_name: str, modality: str = "both", return_ids: bool = False):
     """Build dataset loading graphs and optionally T1 volumes."""
     labels = load_labels(label_path)
     graphs, y = [], []
@@ -309,4 +371,8 @@ def build_dataset(label_path: str, outputs_root: str, t1_root: str,
     if missing:
         print(f"Skipped {len(missing)} subjects: {missing[:5]}...")
 
+    if return_ids:
+        missing_set = set(missing)
+        ids = [sid for sid in labels if sid not in missing_set]
+        return graphs, y, ids
     return graphs, y

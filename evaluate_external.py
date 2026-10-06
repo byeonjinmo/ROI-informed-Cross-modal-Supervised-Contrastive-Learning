@@ -30,7 +30,8 @@ from models.gnn import GNNBackbone
 from models.multimodal_fusion import MultimodalFusion
 
 # Shared utilities
-from utils import compute_metrics, find_optimal_threshold
+from sklearn.metrics import roc_auc_score
+from utils import compute_metrics, find_optimal_threshold, bootstrap_ci
 
 
 
@@ -289,7 +290,39 @@ def evaluate(model, loader, device):
     return np.array(y_true), np.array(y_prob)
 
 
-def evaluate_ensemble(model_paths, loader, device, args):
+def fold_normalizer_path(model_path) -> Path:
+    """fold_3_model.pt -> feat_norm_fold3.npz (saved by train.py next to the model)."""
+    model_path = Path(model_path)
+    fold_id = model_path.stem.replace("fold_", "").replace("_model", "")
+    return model_path.parent / f"feat_norm_fold{fold_id}.npz"
+
+
+def build_loader(graphs_raw, model_path, args):
+    """Normalize with the statistics of the fold that trained this model."""
+    norm_path = args.train_normalizer or fold_normalizer_path(model_path)
+    if os.path.exists(norm_path):
+        transform = load_train_normalizer(str(norm_path))
+    else:
+        print(f"[WARN] Train normalizer not found ({norm_path}); fitting on external data (NOT RECOMMENDED)")
+        transform = fit_feature_normalizer_robust(graphs_raw, skip_cols=(1,))
+    graphs = [transform(g) for g in graphs_raw]
+    return DataLoader(graphs, batch_size=args.batch_size, shuffle=False)
+
+
+def load_train_thresholds(results_path, model_paths):
+    """Thresholds chosen on inner-val during training (results.json from train.py)."""
+    with open(results_path, "r") as f:
+        cv_results = json.load(f)["cv_results"]
+    by_fold = {int(r["fold"]): float(r["threshold"]) for r in cv_results}
+    thresholds = []
+    for p in model_paths:
+        fold_id = Path(p).stem.replace("fold_", "").replace("_model", "")
+        if fold_id.isdigit() and int(fold_id) in by_fold:
+            thresholds.append(by_fold[int(fold_id)])
+    return thresholds or list(by_fold.values())
+
+
+def evaluate_ensemble(model_paths, graphs_raw, device, args):
     """Run inference with multiple checkpoints and average probabilities."""
     y_true = None
     all_probs = []
@@ -297,6 +330,7 @@ def evaluate_ensemble(model_paths, loader, device, args):
     for idx, model_path in enumerate(model_paths, start=1):
         print(f"[Ensemble] Loading model {idx}/{len(model_paths)}: {model_path}")
         model = load_model(args, device, model_path=str(model_path))
+        loader = build_loader(graphs_raw, model_path, args)
         y_true_i, y_prob_i = evaluate(model, loader, device)
         if y_true is None:
             y_true = y_true_i
@@ -380,7 +414,11 @@ def main():
 
     # Train normalizer
     parser.add_argument("--train-normalizer", default=None,
-                        help="Path to feat_norm.npz (train normalizer stats)")
+                        help="Force one feat_norm npz for all models. Default: use "
+                             "feat_norm_fold{k}.npz next to each fold_{k}_model.pt")
+    parser.add_argument("--train-results", default=None,
+                        help="results.json from train.py; the decision threshold is the mean of "
+                             "the inner-val thresholds (default: <model-dir>/results.json)")
 
     # ReHo fill mode
     parser.add_argument("--reho-fill-mode", choices=["zeros", "train_mean"], default="zeros")
@@ -443,23 +481,8 @@ def main():
     if report_feature_health(graphs, col_names, tag="before normalization"):
         graphs = sanitize_graph_features(graphs)
 
-    # Normalize
-    if args.train_normalizer and os.path.exists(args.train_normalizer):
-        transform = load_train_normalizer(args.train_normalizer)
-        graphs = [transform(g) for g in graphs]
-    else:
-        print("[WARN] Train normalizer not provided, fitting on external data (NOT RECOMMENDED)")
-        normalizer = fit_feature_normalizer_robust(graphs, skip_cols=(1,))
-        graphs = [normalizer(g) for g in graphs]
-
-    loader = DataLoader(graphs, batch_size=args.batch_size, shuffle=False)
-
-    # Inference
-    if len(model_paths) == 1:
-        model = load_model(args, device, model_path=str(model_paths[0]))
-        y_true, y_prob = evaluate(model, loader, device)
-    else:
-        y_true, y_prob = evaluate_ensemble(model_paths, loader, device, args)
+    # Inference (each model normalized with its own fold's training statistics)
+    y_true, y_prob = evaluate_ensemble(model_paths, graphs, device, args)
 
     # Handle NaN/Inf
     if np.any(np.isnan(y_prob)) or np.any(np.isinf(y_prob)):
@@ -467,16 +490,32 @@ def main():
         y_true = y_true[valid_mask]
         y_prob = y_prob[valid_mask]
 
-    # Threshold
-    threshold = args.threshold if args.threshold is not None else find_optimal_threshold(y_true, y_prob)
+    # Threshold: fixed before seeing external labels (no tuning on external data)
+    if args.threshold is not None:
+        threshold, threshold_source = args.threshold, "user-specified"
+    else:
+        results_path = args.train_results or (
+            os.path.join(args.model_dir, "results.json") if args.model_dir else None)
+        if results_path and os.path.exists(results_path):
+            thresholds = load_train_thresholds(results_path, model_paths)
+            threshold = float(np.mean(thresholds))
+            threshold_source = f"mean inner-val threshold from {results_path}"
+        else:
+            threshold, threshold_source = 0.5, "default 0.5 (train results.json not found)"
 
     # Metrics
     metrics = compute_metrics(y_true, y_prob, threshold=threshold)
+    auc_ci = bootstrap_ci(y_true, y_prob, roc_auc_score)
+    # Youden-optimal threshold on the external labels is optimistic (label leakage);
+    # reported for reference only, never as the main result.
+    oracle_thr = find_optimal_threshold(y_true, y_prob)
+    oracle_metrics = compute_metrics(y_true, y_prob, threshold=oracle_thr)
 
     print("\n" + "=" * 70)
     print("EXTERNAL VALIDATION RESULTS")
     print("=" * 70)
-    print(f"Threshold: {threshold:.3f}")
+    print(f"Threshold: {threshold:.3f} ({threshold_source})")
+    print(f"  AUC 95% CI:   [{auc_ci[0]:.4f}, {auc_ci[1]:.4f}]")
     print(f"  AUC:          {metrics['auc']:.4f}")
     print(f"  AUPR:         {metrics['aupr']:.4f}")
     print(f"  Balanced Acc: {metrics['balanced_accuracy']:.4f}")
@@ -485,6 +524,8 @@ def main():
     print(f"  F1:           {metrics['f1']:.4f}")
     print(f"  Kappa:        {metrics['kappa']:.4f}")
     print(f"  MCC:          {metrics['mcc']:.4f}")
+    print(f"  [Reference only, optimistic] Youden on external labels: thr={oracle_thr:.3f}, "
+          f"BAcc={oracle_metrics['balanced_accuracy']:.4f}")
     print("=" * 70)
 
     # Save
@@ -494,7 +535,15 @@ def main():
         "ensemble": len(model_paths) > 1,
         "num_samples": len(graphs),
         "threshold": float(threshold),
+        "threshold_source": threshold_source,
         "metrics": {k: float(v) if not isinstance(v, int) else v for k, v in metrics.items()},
+        "auc_ci95": list(auc_ci),
+        "oracle_reference_only": {
+            "threshold": float(oracle_thr),
+            "balanced_accuracy": float(oracle_metrics["balanced_accuracy"]),
+            "sensitivity": float(oracle_metrics["sensitivity"]),
+            "specificity": float(oracle_metrics["specificity"]),
+        },
         "timestamp": datetime.now().isoformat()
     }
 

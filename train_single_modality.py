@@ -1,7 +1,9 @@
 """
 Single Modality Depression Classification
 T1 MRI only OR rs-fMRI only
-5-Fold Cross-Validation with full statistical metrics
+Leakage-free nested CV over the full dataset (same protocol as train.py):
+outer stratified K-fold = held-out test; inner-val (from outer-train) for
+early stopping + threshold; metrics reported on outer test folds only.
 
 Usage:
     # T1 with MedicalNet ResNet-18 (pretrained)
@@ -25,8 +27,8 @@ os.environ['PYTHONHASHSEED'] = '42'
 
 import numpy as np
 import torch
+import pandas as pd
 import torch.nn as nn
-from sklearn.model_selection import StratifiedKFold
 from torch_geometric.loader import DataLoader
 
 from models.resnet3d import MedicalNetResNet18, Simple3DCNN, load_medicalnet_pretrained
@@ -35,7 +37,11 @@ from models.multimodal_fusion import SingleModalityModel
 
 # Shared utilities
 from utils import (set_seed, fit_feature_normalizer, compute_metrics,
-                   find_optimal_threshold, build_dataset)
+                   find_optimal_threshold, build_dataset, make_nested_splits,
+                   summarize_oof)
+
+REPORT_METRICS = ["auc", "aupr", "accuracy", "balanced_accuracy", "sensitivity", "specificity",
+                  "ppv", "npv", "f1", "f1_weighted", "kappa", "mcc"]
 
 
 def train_epoch(model, loader, device, criterion, optimizer) -> float:
@@ -95,7 +101,12 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=1e-3)
 
     # CV settings
-    parser.add_argument("--folds", type=int, default=5)
+    parser.add_argument("--folds", type=int, default=5,
+                        help="Outer CV folds over the full dataset (each fold = held-out test)")
+    parser.add_argument("--inner-val-size", type=float, default=0.125,
+                        help="Fraction of outer-train used for early stopping + threshold")
+    parser.add_argument("--n-bootstrap", type=int, default=10000)
+    parser.add_argument("--fixed-threshold", type=float, default=None)
     parser.add_argument("--seed", type=int, default=42)
 
     # Output
@@ -110,9 +121,9 @@ def main():
     print("="*70)
 
     # Load data
-    graphs, labels = build_dataset(
+    graphs, labels, subject_ids = build_dataset(
         args.label_path, args.outputs_root, args.t1_root, args.adj_name,
-        modality=args.modality
+        modality=args.modality, return_ids=True
     )
 
     if not graphs:
@@ -121,20 +132,29 @@ def main():
     labels_array = np.array(labels)
     print(f"Total: {len(graphs)} (0={sum(labels_array==0)}, 1={sum(labels_array==1)})")
 
-    kfold = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=args.seed)
     os.makedirs(args.save_dir, exist_ok=True)
 
     fold_results = []
+    oof_prob = np.full(len(graphs), np.nan)
+    oof_pred = np.full(len(graphs), -1, dtype=int)
+    oof_fold = np.zeros(len(graphs), dtype=int)
 
-    for fold, (train_idx, val_idx) in enumerate(kfold.split(np.arange(len(graphs)), labels_array), 1):
+    splits = make_nested_splits(labels_array, n_folds=args.folds,
+                                inner_val_size=args.inner_val_size, seed=args.seed)
+    for fold, train_idx, val_idx, test_idx in splits:
         print(f"\n{'-'*70}\nFold {fold}/{args.folds}\n{'-'*70}")
+        print(f"  Train={len(train_idx)}, Val={len(val_idx)}, Test={len(test_idx)}")
 
         train_graphs_raw = [graphs[i] for i in train_idx]
         val_graphs_raw = [graphs[i] for i in val_idx]
+        test_graphs_raw = [graphs[i] for i in test_idx]
 
-        normalizer = fit_feature_normalizer(train_graphs_raw, skip_cols=(1,))
+        normalizer = fit_feature_normalizer(
+            train_graphs_raw, skip_cols=(1,),
+            save_path=os.path.join(args.save_dir, f"feat_norm_fold{fold}.npz"))
         train_graphs = [normalizer(g) for g in train_graphs_raw]
         val_graphs = [normalizer(g) for g in val_graphs_raw]
+        test_graphs = [normalizer(g) for g in test_graphs_raw]
 
         y_train = torch.tensor([g.y.item() for g in train_graphs])
         pos = (y_train == 1).sum().item()
@@ -142,6 +162,7 @@ def main():
 
         train_loader = DataLoader(train_graphs, batch_size=args.batch_size, shuffle=True)
         val_loader = DataLoader(val_graphs, batch_size=args.batch_size, shuffle=False)
+        test_loader = DataLoader(test_graphs, batch_size=args.batch_size, shuffle=False)
 
         # Build model
         if args.modality == "t1":
@@ -200,25 +221,24 @@ def main():
         if best_state:
             model.load_state_dict(best_state)
 
-        y_true, y_prob = evaluate(model, val_loader, device)
-        optimal_thr = find_optimal_threshold(y_true, y_prob)
-        val_metrics = compute_metrics(y_true, y_prob, threshold=optimal_thr)
+        # Threshold from inner-val; single evaluation on the outer test fold
+        y_val_true, y_val_prob = evaluate(model, val_loader, device)
+        thr = (args.fixed_threshold if args.fixed_threshold is not None
+               else find_optimal_threshold(y_val_true, y_val_prob))
+        val_auc = compute_metrics(y_val_true, y_val_prob, threshold=thr)["auc"]
 
-        print(f"\n  Fold {fold}: AUC={val_metrics['auc']:.4f}, Sens={val_metrics['sensitivity']:.4f}, Spec={val_metrics['specificity']:.4f}")
+        y_test_true, y_test_prob = evaluate(model, test_loader, device)
+        test_metrics = compute_metrics(y_test_true, y_test_prob, threshold=thr)
+        oof_prob[test_idx] = y_test_prob
+        oof_pred[test_idx] = (y_test_prob >= thr).astype(int)
+        oof_fold[test_idx] = fold
 
-        fold_results.append({
-            "fold": fold,
-            "val_auc": val_metrics["auc"],
-            "val_aupr": val_metrics["aupr"],
-            "val_accuracy": val_metrics["accuracy"],
-            "val_balanced_accuracy": val_metrics["balanced_accuracy"],
-            "val_sensitivity": val_metrics["sensitivity"],
-            "val_specificity": val_metrics["specificity"],
-            "val_f1": val_metrics["f1"],
-            "val_kappa": val_metrics["kappa"],
-            "val_mcc": val_metrics["mcc"],
-            "threshold": optimal_thr
-        })
+        print(f"\n  Fold {fold} Test: AUC={test_metrics['auc']:.4f}, Sens={test_metrics['sensitivity']:.4f}, "
+              f"Spec={test_metrics['specificity']:.4f} (thr={thr:.3f} from inner-val)")
+
+        fold_result = {"fold": fold, "threshold": thr, "val_auc": val_auc}
+        fold_result.update({f"test_{k}": test_metrics[k] for k in REPORT_METRICS})
+        fold_results.append(fold_result)
 
         torch.save(best_state, os.path.join(args.save_dir, f"fold_{fold}_model.pt"))
 
@@ -226,20 +246,29 @@ def main():
     print(f"\n{'='*70}")
     print(f"RESULTS: {args.modality.upper()} only")
     print(f"{'='*70}")
-    cv_auc = np.mean([r["val_auc"] for r in fold_results])
-    cv_auc_std = np.std([r["val_auc"] for r in fold_results])
-    print(f"  AUC: {cv_auc:.4f} +/- {cv_auc_std:.4f}")
+    assert not np.isnan(oof_prob).any(), "Some subjects never appeared in a test fold"
+    pooled = summarize_oof(labels_array, oof_prob, oof_pred, n_boot=args.n_bootstrap, seed=args.seed)
 
     results = {
         "config": vars(args),
+        "evaluation": "nested_cv_full_dataset",
+        "n_subjects": len(graphs),
         "cv_results": fold_results,
-        "cv_auc_mean": float(cv_auc),
-        "cv_auc_std": float(cv_auc_std),
+        "pooled_oof": {k: (list(v) if isinstance(v, tuple) else float(v)) for k, v in pooled.items()},
         "timestamp": datetime.now().isoformat()
     }
+    for k in REPORT_METRICS:
+        vals = [r[f"test_{k}"] for r in fold_results]
+        results[f"cv_{k}_mean"], results[f"cv_{k}_std"] = float(np.mean(vals)), float(np.std(vals))
+        print(f"  {k:<18} test folds {np.mean(vals):.4f} +/- {np.std(vals):.4f}   pooled OOF {pooled[k]:.4f}")
+    print(f"  Pooled AUC 95% CI: [{pooled['auc_ci95'][0]:.4f}, {pooled['auc_ci95'][1]:.4f}]")
 
     with open(os.path.join(args.save_dir, "results.json"), "w") as f:
         json.dump(results, f, indent=2, default=str)
+
+    pd.DataFrame({"subject_id": subject_ids, "fold": oof_fold, "y_true": labels_array,
+                  "y_prob": oof_prob, "y_pred": oof_pred}
+                 ).to_csv(os.path.join(args.save_dir, "oof_predictions.csv"), index=False)
 
     print(f"Results saved to: {args.save_dir}")
 

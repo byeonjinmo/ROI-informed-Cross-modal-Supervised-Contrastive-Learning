@@ -1,9 +1,15 @@
 """
 Multimodal Depression Classification
 T1 MRI (MedicalNet 3D ResNet) + rs-fMRI (GNN)
-5-Fold Cross-Validation with 20% Holdout Test
 
-Target: AUC >= 0.8
+Leakage-free 5-fold evaluation over the FULL dataset (in-house or SRPBS),
+matching manuscript Sec. 3.5 (participant-level stratified, 70:10:20 per fold):
+  - Outer stratified K-fold: every subject is in exactly one test fold.
+  - Inner split of the remaining subjects: inner-train (model + feature
+    normalizer fit) / inner-val (early stopping + Youden threshold).
+  - The outer test fold is evaluated once, with the frozen model and the
+    threshold chosen on inner-val. Reported metrics are test-fold metrics
+    (mean +/- SD across folds) and pooled out-of-fold metrics with bootstrap CI.
 """
 
 import argparse
@@ -17,9 +23,9 @@ os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 os.environ['PYTHONHASHSEED'] = '42'
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-from sklearn.model_selection import StratifiedKFold, train_test_split
 from torch_geometric.loader import DataLoader
 
 # Model imports
@@ -28,9 +34,12 @@ from models.gnn import GNNBackbone
 from models.multimodal_fusion import MultimodalFusion, SingleModalityModel
 
 # Shared utilities
-from utils import (set_seed, load_labels, load_subject_graph, load_t1_volume,
-                   fit_feature_normalizer, compute_metrics, find_optimal_threshold,
-                   compute_statistical_tests, build_dataset)
+from utils import (set_seed, fit_feature_normalizer, compute_metrics, find_optimal_threshold,
+                   compute_statistical_tests, build_dataset, make_nested_splits,
+                   summarize_oof)
+
+REPORT_METRICS = ["auc", "aupr", "accuracy", "balanced_accuracy", "sensitivity", "specificity",
+                  "ppv", "npv", "f1", "f1_weighted", "kappa", "mcc"]
 
 
 def train_epoch(model, loader, device, criterion, optimizer,
@@ -179,8 +188,13 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=1e-3)
 
     # CV settings
-    parser.add_argument("--folds", type=int, default=5)
-    parser.add_argument("--test-size", type=float, default=0.2)
+    parser.add_argument("--folds", type=int, default=5,
+                        help="Outer CV folds over the full dataset (each fold = held-out test)")
+    parser.add_argument("--inner-val-size", type=float, default=0.125,
+                        help="Fraction of each outer-train split used as inner validation "
+                             "(early stopping + threshold selection)")
+    parser.add_argument("--n-bootstrap", type=int, default=10000,
+                        help="Bootstrap resamples for pooled out-of-fold CI")
     parser.add_argument("--seed", type=int, default=42)
 
     # Output
@@ -188,7 +202,7 @@ def main():
 
     # Threshold
     parser.add_argument("--fixed-threshold", type=float, default=None,
-                        help="Use fixed threshold instead of optimizing (e.g., 0.5)")
+                        help="Use fixed threshold instead of optimizing on inner-val (e.g., 0.5)")
 
     args = parser.parse_args()
     set_seed(args.seed)
@@ -197,14 +211,16 @@ def main():
     print("="*70)
     print("Multimodal Depression Classification")
     print("T1 (MedicalNet ResNet18) + rs-fMRI (GNN)")
-    print("5-Fold CV (80% Train) + 20% Holdout")
+    print(f"Nested {args.folds}-fold CV over full dataset "
+          f"(inner val = {args.inner_val_size:.0%} of outer-train)")
     print("="*70)
     print(f"Device: {device}")
 
-    # Load data
+    # Load data (all subjects are used; none are left out unused)
     print("\nLoading multimodal data...")
-    graphs, labels = build_dataset(
-        args.label_path, args.outputs_root, args.t1_root, args.adj_name
+    graphs, labels, subject_ids = build_dataset(
+        args.label_path, args.outputs_root, args.t1_root, args.adj_name,
+        modality=args.modality, return_ids=True
     )
 
     if not graphs:
@@ -215,64 +231,42 @@ def main():
     print(f"Class 0 (Normal): {sum(labels_array == 0)}")
     print(f"Class 1 (High-risk): {sum(labels_array == 1)}")
 
-    # Split: 20% holdout test, 80% for CV
-    all_indices = np.arange(len(graphs))
-    cv_indices, test_indices = train_test_split(
-        all_indices, test_size=args.test_size,
-        stratify=labels_array, random_state=args.seed
-    )
-
-    cv_labels = labels_array[cv_indices]
-
-    print(f"\nData Split:")
-    print(f"  Train: {len(cv_indices)} (0={sum(cv_labels==0)}, 1={sum(cv_labels==1)})")
-    print(f"  Test:  {len(test_indices)} (0={sum(labels_array[test_indices]==0)}, 1={sum(labels_array[test_indices]==1)})")
-
-    # 5-Fold CV
-    kfold = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=args.seed)
-
     os.makedirs(args.save_dir, exist_ok=True)
 
     fold_results = []
-    fold_models = []
+    # Out-of-fold predictions: each subject is predicted exactly once, by the
+    # model whose outer test fold contains it.
+    oof_prob = np.full(len(graphs), np.nan)
+    oof_pred = np.full(len(graphs), -1, dtype=int)
+    oof_fold = np.zeros(len(graphs), dtype=int)
 
-    for fold, (train_idx, val_idx) in enumerate(kfold.split(cv_indices, cv_labels), 1):
+    splits = make_nested_splits(labels_array, n_folds=args.folds,
+                                inner_val_size=args.inner_val_size, seed=args.seed)
+    for fold, train_idx, val_idx, test_idx in splits:
         print(f"\n{'-'*70}")
         print(f"Fold {fold}/{args.folds}")
         print(f"{'-'*70}")
 
-        # Map to original indices
-        fold_train_idx = cv_indices[train_idx]
-        fold_val_idx = cv_indices[val_idx]
+        train_graphs_raw = [graphs[i] for i in train_idx]
+        val_graphs_raw = [graphs[i] for i in val_idx]
+        test_graphs_raw = [graphs[i] for i in test_idx]
 
-        train_graphs_raw = [graphs[i] for i in fold_train_idx]
-        val_graphs_raw = [graphs[i] for i in fold_val_idx]
+        for name, idx in [("Train", train_idx), ("Val", val_idx), ("Test", test_idx)]:
+            n_pos = int(labels_array[idx].sum())
+            print(f"  {name:<5} {len(idx)} (pos={n_pos}, neg={len(idx) - n_pos}, "
+                  f"ratio={n_pos / len(idx) * 100:.1f}%)")
 
-        # Class distribution per fold
-        y_train_labels = [g.y.item() for g in train_graphs_raw]
-        train_pos = sum(y_train_labels)
-        train_neg = len(y_train_labels) - train_pos
-
-        y_val_labels = [g.y.item() for g in val_graphs_raw]
-        val_pos = sum(y_val_labels)
-        val_neg = len(y_val_labels) - val_pos
-
-        print(f"  Train: {len(train_graphs_raw)} (pos={train_pos}, neg={train_neg}, ratio={train_pos/len(train_graphs_raw)*100:.1f}%)")
-        print(f"  Val:   {len(val_graphs_raw)} (pos={val_pos}, neg={val_neg}, ratio={val_pos/len(val_graphs_raw)*100:.1f}%)")
-
-        # Normalize graph features (fit on train only)
-        norm_save_path = os.path.join(args.save_dir, "feat_norm.npz") if fold == 1 else None
+        # Normalize graph features (fit on inner-train only; applied to val/test)
+        norm_save_path = os.path.join(args.save_dir, f"feat_norm_fold{fold}.npz")
         normalizer = fit_feature_normalizer(train_graphs_raw, skip_cols=(1,), save_path=norm_save_path)
         train_graphs = [normalizer(g) for g in train_graphs_raw]
         val_graphs = [normalizer(g) for g in val_graphs_raw]
+        test_graphs = [normalizer(g) for g in test_graphs_raw]
 
-        # Save ReHo mean per ROI on first fold for external validation
-        if fold == 1:
-            reho_per_subject = torch.stack([g.x[:, 0] for g in train_graphs_raw])
-            reho_mean_per_roi = reho_per_subject.mean(dim=0).numpy()
-            reho_save_path = os.path.join(args.save_dir, "train_reho_mean_200.npy")
-            np.save(reho_save_path, reho_mean_per_roi)
-            print(f"[ReHo] Saved train mean per ROI to {reho_save_path}")
+        # Save ReHo mean per ROI (inner-train only) for external validation
+        reho_per_subject = torch.stack([g.x[:, 0] for g in train_graphs_raw])
+        reho_mean_per_roi = reho_per_subject.mean(dim=0).numpy()
+        np.save(os.path.join(args.save_dir, f"train_reho_mean_200_fold{fold}.npy"), reho_mean_per_roi)
 
         # Count classes for pos_weight
         y_train = torch.tensor([g.y.item() for g in train_graphs])
@@ -281,6 +275,7 @@ def main():
 
         train_loader = DataLoader(train_graphs, batch_size=args.batch_size, shuffle=True)
         val_loader = DataLoader(val_graphs, batch_size=args.batch_size, shuffle=False)
+        test_loader = DataLoader(test_graphs, batch_size=args.batch_size, shuffle=False)
 
         # Build model based on modality
         if args.modality == "t1":
@@ -464,118 +459,89 @@ def main():
         if best_state:
             model.load_state_dict(best_state)
 
-        # Evaluate on VAL set
-        y_true, y_prob = evaluate(model, val_loader, device)
-        optimal_thr = find_optimal_threshold(y_true, y_prob)
-        val_metrics = compute_metrics(y_true, y_prob, threshold=optimal_thr)
+        # Threshold selected on inner-val only (never on the test fold)
+        y_val_true, y_val_prob = evaluate(model, val_loader, device)
+        if args.fixed_threshold is not None:
+            thr = args.fixed_threshold
+        else:
+            thr = find_optimal_threshold(y_val_true, y_val_prob)
+        val_metrics = compute_metrics(y_val_true, y_val_prob, threshold=thr)
 
-        print(f"\n  Fold {fold} Val Results (threshold={optimal_thr:.3f}):")
-        print(f"    AUC={val_metrics['auc']:.4f}, AUPR={val_metrics['aupr']:.4f}, BAcc={val_metrics['balanced_accuracy']:.4f}")
-        print(f"    Sens={val_metrics['sensitivity']:.4f}, Spec={val_metrics['specificity']:.4f}")
-        print(f"    PPV={val_metrics['ppv']:.4f}, NPV={val_metrics['npv']:.4f}")
-        print(f"    Kappa={val_metrics['kappa']:.4f}, MCC={val_metrics['mcc']:.4f}")
+        # Single final evaluation on the untouched outer test fold
+        y_test_true, y_test_prob = evaluate(model, test_loader, device)
+        test_metrics = compute_metrics(y_test_true, y_test_prob, threshold=thr)
 
-        fold_results.append({
-            "fold": fold,
-            "val_auc": val_metrics["auc"],
-            "val_aupr": val_metrics["aupr"],
-            "val_accuracy": val_metrics["accuracy"],
-            "val_balanced_accuracy": val_metrics["balanced_accuracy"],
-            "val_sensitivity": val_metrics["sensitivity"],
-            "val_specificity": val_metrics["specificity"],
-            "val_ppv": val_metrics["ppv"],
-            "val_npv": val_metrics["npv"],
-            "val_f1": val_metrics["f1"],
-            "val_f1_weighted": val_metrics["f1_weighted"],
-            "val_kappa": val_metrics["kappa"],
-            "val_mcc": val_metrics["mcc"],
-            "threshold": optimal_thr
-        })
-        fold_models.append(best_state)
+        oof_prob[test_idx] = y_test_prob
+        oof_pred[test_idx] = (y_test_prob >= thr).astype(int)
+        oof_fold[test_idx] = fold
+
+        print(f"\n  Fold {fold} (threshold={thr:.3f} from inner-val, val AUC={val_metrics['auc']:.4f})")
+        print(f"  Test: AUC={test_metrics['auc']:.4f}, AUPR={test_metrics['aupr']:.4f}, BAcc={test_metrics['balanced_accuracy']:.4f}")
+        print(f"        Sens={test_metrics['sensitivity']:.4f}, Spec={test_metrics['specificity']:.4f}")
+        print(f"        PPV={test_metrics['ppv']:.4f}, NPV={test_metrics['npv']:.4f}")
+        print(f"        Kappa={test_metrics['kappa']:.4f}, MCC={test_metrics['mcc']:.4f}")
+
+        fold_result = {"fold": fold, "threshold": thr,
+                       "n_train": len(train_idx), "n_val": len(val_idx), "n_test": len(test_idx),
+                       "val_auc": val_metrics["auc"]}  # model-selection score, for reference only
+        fold_result.update({f"test_{k}": test_metrics[k] for k in REPORT_METRICS})
+        fold_results.append(fold_result)
 
         # Save fold model
         torch.save(best_state, os.path.join(args.save_dir, f"fold_{fold}_model.pt"))
 
-    # Results Summary
+    assert not np.isnan(oof_prob).any(), "Some subjects never appeared in a test fold"
+
+    # Results Summary (test folds only)
     print(f"\n{'='*100}")
-    print("5-FOLD CROSS-VALIDATION RESULTS")
+    print(f"NESTED {args.folds}-FOLD CV: OUTER TEST-FOLD RESULTS")
     print(f"{'='*100}")
 
     print(f"\n{'Fold':<6}{'AUC':<8}{'AUPR':<8}{'BAcc':<8}{'Sens':<8}{'Spec':<8}{'PPV':<8}{'NPV':<8}{'Kappa':<8}{'MCC':<8}")
     print("-" * 96)
+    table_cols = ["auc", "aupr", "balanced_accuracy", "sensitivity", "specificity", "ppv", "npv", "kappa", "mcc"]
     for r in fold_results:
-        print(f"{r['fold']:<6}{r['val_auc']:<8.4f}{r['val_aupr']:<8.4f}{r['val_balanced_accuracy']:<8.4f}"
-              f"{r['val_sensitivity']:<8.4f}{r['val_specificity']:<8.4f}{r['val_ppv']:<8.4f}"
-              f"{r['val_npv']:<8.4f}{r['val_kappa']:<8.4f}{r['val_mcc']:<8.4f}")
+        print(f"{r['fold']:<6}" + "".join(f"{r[f'test_{k}']:<8.4f}" for k in table_cols))
 
-    cv_auc_mean = np.mean([r["val_auc"] for r in fold_results])
-    cv_auc_std = np.std([r["val_auc"] for r in fold_results])
-    cv_aupr_mean = np.mean([r["val_aupr"] for r in fold_results])
-    cv_aupr_std = np.std([r["val_aupr"] for r in fold_results])
-    cv_acc_mean = np.mean([r["val_accuracy"] for r in fold_results])
-    cv_acc_std = np.std([r["val_accuracy"] for r in fold_results])
-    cv_bacc_mean = np.mean([r["val_balanced_accuracy"] for r in fold_results])
-    cv_bacc_std = np.std([r["val_balanced_accuracy"] for r in fold_results])
-    cv_sens_mean = np.mean([r["val_sensitivity"] for r in fold_results])
-    cv_sens_std = np.std([r["val_sensitivity"] for r in fold_results])
-    cv_spec_mean = np.mean([r["val_specificity"] for r in fold_results])
-    cv_spec_std = np.std([r["val_specificity"] for r in fold_results])
-    cv_ppv_mean = np.mean([r["val_ppv"] for r in fold_results])
-    cv_ppv_std = np.std([r["val_ppv"] for r in fold_results])
-    cv_npv_mean = np.mean([r["val_npv"] for r in fold_results])
-    cv_npv_std = np.std([r["val_npv"] for r in fold_results])
-    cv_f1_mean = np.mean([r["val_f1"] for r in fold_results])
-    cv_f1_std = np.std([r["val_f1"] for r in fold_results])
-    cv_f1w_mean = np.mean([r["val_f1_weighted"] for r in fold_results])
-    cv_f1w_std = np.std([r["val_f1_weighted"] for r in fold_results])
-    cv_kappa_mean = np.mean([r["val_kappa"] for r in fold_results])
-    cv_kappa_std = np.std([r["val_kappa"] for r in fold_results])
-    cv_mcc_mean = np.mean([r["val_mcc"] for r in fold_results])
-    cv_mcc_std = np.std([r["val_mcc"] for r in fold_results])
+    summary = {}
+    for k in REPORT_METRICS:
+        vals = [r[f"test_{k}"] for r in fold_results]
+        summary[k] = (float(np.mean(vals)), float(np.std(vals)))
 
     print("-" * 96)
-    print(f"{'Mean':<6}{cv_auc_mean:<8.4f}{cv_aupr_mean:<8.4f}{cv_bacc_mean:<8.4f}"
-          f"{cv_sens_mean:<8.4f}{cv_spec_mean:<8.4f}{cv_ppv_mean:<8.4f}"
-          f"{cv_npv_mean:<8.4f}{cv_kappa_mean:<8.4f}{cv_mcc_mean:<8.4f}")
-    print(f"{'Std':<6}{cv_auc_std:<8.4f}{cv_aupr_std:<8.4f}{cv_bacc_std:<8.4f}"
-          f"{cv_sens_std:<8.4f}{cv_spec_std:<8.4f}{cv_ppv_std:<8.4f}"
-          f"{cv_npv_std:<8.4f}{cv_kappa_std:<8.4f}{cv_mcc_std:<8.4f}")
+    print(f"{'Mean':<6}" + "".join(f"{summary[k][0]:<8.4f}" for k in table_cols))
+    print(f"{'Std':<6}" + "".join(f"{summary[k][1]:<8.4f}" for k in table_cols))
+
+    # Pooled out-of-fold metrics over all subjects
+    pooled = summarize_oof(labels_array, oof_prob, oof_pred, n_boot=args.n_bootstrap, seed=args.seed)
+
+    display_names = {"auc": "AUC", "aupr": "AUPR", "accuracy": "Accuracy",
+                     "balanced_accuracy": "Balanced Acc", "sensitivity": "Sensitivity",
+                     "specificity": "Specificity", "ppv": "PPV (Precision)", "npv": "NPV",
+                     "f1": "F1-Score", "f1_weighted": "F1 (weighted)",
+                     "kappa": "Cohen's Kappa", "mcc": "MCC"}
 
     print(f"\n{'='*100}")
-    print("SUMMARY")
+    print(f"SUMMARY (leak-free; N={len(graphs)} subjects, each predicted once as test)")
     print(f"{'='*100}")
-    print(f"  AUC:              {cv_auc_mean:.4f} +/- {cv_auc_std:.4f}")
-    print(f"  AUPR:             {cv_aupr_mean:.4f} +/- {cv_aupr_std:.4f}")
-    print(f"  Accuracy:         {cv_acc_mean:.4f} +/- {cv_acc_std:.4f}")
-    print(f"  Balanced Acc:     {cv_bacc_mean:.4f} +/- {cv_bacc_std:.4f}")
-    print(f"  Sensitivity:      {cv_sens_mean:.4f} +/- {cv_sens_std:.4f}")
-    print(f"  Specificity:      {cv_spec_mean:.4f} +/- {cv_spec_std:.4f}")
-    print(f"  PPV (Precision):  {cv_ppv_mean:.4f} +/- {cv_ppv_std:.4f}")
-    print(f"  NPV:              {cv_npv_mean:.4f} +/- {cv_npv_std:.4f}")
-    print(f"  F1-Score:         {cv_f1_mean:.4f} +/- {cv_f1_std:.4f}")
-    print(f"  Cohen's Kappa:    {cv_kappa_mean:.4f} +/- {cv_kappa_std:.4f}")
-    print(f"  MCC:              {cv_mcc_mean:.4f} +/- {cv_mcc_std:.4f}")
+    print(f"  {'Metric':<18}{'Test folds mean+/-SD':<24}{'Pooled OOF':<12}")
+    for k in REPORT_METRICS:
+        print(f"  {display_names[k]:<18}{summary[k][0]:.4f} +/- {summary[k][1]:.4f}      {pooled[k]:.4f}")
+    print(f"  Pooled AUC 95% CI (bootstrap): [{pooled['auc_ci95'][0]:.4f}, {pooled['auc_ci95'][1]:.4f}]")
+    print(f"  Pooled AUPR 95% CI (bootstrap): [{pooled['aupr_ci95'][0]:.4f}, {pooled['aupr_ci95'][1]:.4f}]")
     print(f"{'='*100}")
 
     # Statistical validation
-    stat_tests = compute_statistical_tests(fold_results)
+    stat_tests = compute_statistical_tests(fold_results, prefix="test")
     print(f"\n{'='*100}")
-    print("STATISTICAL VALIDATION (One-sample t-test, H0: metric = chance level)")
+    print("STATISTICAL VALIDATION (One-sample t-test on test folds, H0: metric = chance level)")
     print(f"{'='*100}")
     print(f"  {'Metric':<20} {'Mean+/-SD':<18} {'t-stat':>8} {'p-value':>10} {'Sig.':>6}")
     print(f"  {'-'*62}")
-    metric_display = {
-        "val_auc": ("AUC", cv_auc_mean, cv_auc_std),
-        "val_aupr": ("AUPR", cv_aupr_mean, cv_aupr_std),
-        "val_balanced_accuracy": ("Balanced Acc", cv_bacc_mean, cv_bacc_std),
-        "val_sensitivity": ("Sensitivity", cv_sens_mean, cv_sens_std),
-        "val_specificity": ("Specificity", cv_spec_mean, cv_spec_std),
-        "val_f1": ("F1-Score", cv_f1_mean, cv_f1_std),
-        "val_kappa": ("Cohen's Kappa", cv_kappa_mean, cv_kappa_std),
-        "val_mcc": ("MCC", cv_mcc_mean, cv_mcc_std),
-    }
     for metric_key, test_result in stat_tests.items():
-        name, mean, std = metric_display[metric_key]
+        k = metric_key[len("test_"):]
+        name = display_names[k]
+        mean, std = summary[k]
         p = test_result["p_value"]
         if p < 0.001:
             sig = "***"
@@ -588,46 +554,33 @@ def main():
         print(f"  {name:<20} {mean:.4f}+/-{std:.4f}    {test_result['t_statistic']:>8.2f} {p:>10.4f} {sig:>6}")
     print(f"  {'-'*62}")
     print(f"  Significance: *** p<0.001, ** p<0.01, * p<0.05, n.s. not significant")
-    print(f"  Note: df=4 (5-fold CV), one-sided test (H1: metric > chance)")
+    print(f"  Note: df={args.folds - 1} ({args.folds}-fold CV), one-sided test (H1: metric > chance)")
     print(f"{'='*100}")
 
-    target_achieved = cv_auc_mean >= 0.8
-
-    # Save results
+    # Save results. cv_<metric>_mean/std are OUTER TEST-FOLD statistics
+    # (key names kept for compatibility with scripts/ that read results.json).
     results = {
         "config": vars(args),
+        "evaluation": "nested_cv_full_dataset",
+        "n_subjects": len(graphs),
         "cv_results": fold_results,
-        "cv_auc_mean": float(cv_auc_mean),
-        "cv_auc_std": float(cv_auc_std),
-        "cv_aupr_mean": float(cv_aupr_mean),
-        "cv_aupr_std": float(cv_aupr_std),
-        "cv_accuracy_mean": float(cv_acc_mean),
-        "cv_accuracy_std": float(cv_acc_std),
-        "cv_balanced_accuracy_mean": float(cv_bacc_mean),
-        "cv_balanced_accuracy_std": float(cv_bacc_std),
-        "cv_sensitivity_mean": float(cv_sens_mean),
-        "cv_sensitivity_std": float(cv_sens_std),
-        "cv_specificity_mean": float(cv_spec_mean),
-        "cv_specificity_std": float(cv_spec_std),
-        "cv_ppv_mean": float(cv_ppv_mean),
-        "cv_ppv_std": float(cv_ppv_std),
-        "cv_npv_mean": float(cv_npv_mean),
-        "cv_npv_std": float(cv_npv_std),
-        "cv_f1_mean": float(cv_f1_mean),
-        "cv_f1_std": float(cv_f1_std),
-        "cv_f1_weighted_mean": float(cv_f1w_mean),
-        "cv_f1_weighted_std": float(cv_f1w_std),
-        "cv_kappa_mean": float(cv_kappa_mean),
-        "cv_kappa_std": float(cv_kappa_std),
-        "cv_mcc_mean": float(cv_mcc_mean),
-        "cv_mcc_std": float(cv_mcc_std),
+        "pooled_oof": {k: (list(v) if isinstance(v, tuple) else float(v)) for k, v in pooled.items()},
         "statistical_tests": stat_tests,
-        "target_achieved": target_achieved,
         "timestamp": datetime.now().isoformat()
     }
+    for k in REPORT_METRICS:
+        results[f"cv_{k}_mean"], results[f"cv_{k}_std"] = summary[k]
 
     with open(os.path.join(args.save_dir, "results.json"), "w") as f:
         json.dump(results, f, indent=2, default=str)
+
+    pd.DataFrame({
+        "subject_id": subject_ids,
+        "fold": oof_fold,
+        "y_true": labels_array,
+        "y_prob": oof_prob,
+        "y_pred": oof_pred,
+    }).to_csv(os.path.join(args.save_dir, "oof_predictions.csv"), index=False)
 
     print(f"\nResults saved to: {args.save_dir}")
 
